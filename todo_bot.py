@@ -31,7 +31,7 @@ async def webhook():
 
 MSK = ZoneInfo("Europe/Moscow")
 
-TOKEN = os.environ.get("7888504026:AAFGQpzSnEfZ9bLXfacCz63jjdfciRryeww")
+TOKEN = os.environ.get("BOT_TOKEN")
 
 # Логирование
 logging.basicConfig(
