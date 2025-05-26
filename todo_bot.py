@@ -1,0 +1,552 @@
+import logging
+from flask import Flask, request
+import os
+import sqlite3
+import asyncio
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
+
+app = Flask(__name__)
+bot_app = None  # глобально, чтобы Webhook мог получить доступ к приложению
+
+@app.route('/')
+def index():
+    return "Бот работает!"
+
+@app.route(f"/{os.environ.get('BOT_TOKEN')}", methods=["POST"])
+async def webhook():
+    update = Update.de_json(request.get_json(force=True), bot_app.bot)
+    await bot_app.process_update(update)
+    return "ok"
+
+MSK = ZoneInfo("Europe/Moscow")
+
+TOKEN = os.environ.get("7888504026:AAFGQpzSnEfZ9bLXfacCz63jjdfciRryeww")
+
+# Логирование
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Константы состояний ConversationHandler
+ADD_TASK, DELETE_TASK, EDIT_SELECT, EDIT_TASK, REMIND_SELECT_TASK, REMIND_DATE, REMIND_TIME, EDIT_REMIND_SELECT, EDIT_REMIND_DATE, EDIT_REMIND_TIME, DELETE_REMIND_SELECT = range(11)
+
+# Инициализация БД
+def init_db():
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    c.execute('''
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        task TEXT NOT NULL,
+        reminder_datetime TEXT
+    )
+    ''')
+    conn.commit()
+    conn.close()
+
+# Главное меню
+def main_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🧾 Управление задачами", callback_data='tasks')],
+        [InlineKeyboardButton("⏰ Напоминания", callback_data='reminders')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# Меню управления задачами
+def tasks_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("➕ Добавить", callback_data='add'),
+            InlineKeyboardButton("✏️ Изменить", callback_data='edit'),
+            InlineKeyboardButton("🗑 Удалить", callback_data='delete'),
+        ],
+        [InlineKeyboardButton("🔙 Назад", callback_data='back')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# Меню напоминаний
+def reminders_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("➕ Установить", callback_data='remind'),
+            InlineKeyboardButton("📝 Изменить", callback_data='edit_reminder'),
+            InlineKeyboardButton("❌ Удалить", callback_data='delete_reminder'),
+        ],
+        [InlineKeyboardButton("🔙 Назад", callback_data='back')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# Команда /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я твой помощник для списка задач.\nВыбирай действие кнопкой 👇",
+        reply_markup=main_keyboard()
+    )
+
+# Получение списка задач пользователя
+def get_tasks(user_id):
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    c.execute("SELECT id, task, reminder_datetime FROM tasks WHERE user_id = ? ORDER BY id", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# Показ списка задач
+async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    tasks = get_tasks(user_id)
+    if not tasks:
+        text = "Список задач пуст."
+    else:
+        text = "Твои задачи:\n"
+        for i, (task_id, task, reminder) in enumerate(tasks, 1):
+            if reminder:
+                try:
+                    dt = datetime.fromisoformat(reminder).astimezone(MSK)
+                    reminder_str = dt.strftime(" (Напоминание: %d.%m.%Y %H:%M)")
+                except:
+                    reminder_str = ""
+            else:
+                reminder_str = ""
+            text += f"{i}. {task}{reminder_str}\n"
+    
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=tasks_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=tasks_keyboard())
+
+# Показ задач с напоминаниями
+async def show_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    tasks = get_tasks(user_id)
+    reminder_tasks = [t for t in tasks if t[2]]
+    
+    if not reminder_tasks:
+        text = "Нет задач с напоминаниями."
+    else:
+        text = "Задачи с напоминаниями:\n"
+        for i, (task_id, task, reminder) in enumerate(reminder_tasks, 1):
+            try:
+                dt = datetime.fromisoformat(reminder).astimezone(MSK)
+                reminder_str = dt.strftime(" (Напоминание: %d.%m.%Y %H:%M)")
+            except:
+                reminder_str = ""
+            text += f"{i}. {task}{reminder_str}\n"
+    
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=reminders_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=reminders_keyboard())
+
+# Обработка нажатий на кнопки в меню
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = query.from_user.id
+
+    if data == 'tasks':
+        await show_tasks(update, context)
+        return ConversationHandler.END
+
+    elif data == 'reminders':
+        await show_reminders(update, context)
+        return ConversationHandler.END
+
+    elif data == 'back':
+        await query.edit_message_text("Главное меню:", reply_markup=main_keyboard())
+        return ConversationHandler.END
+
+    elif data == 'add':
+        await query.edit_message_text("Напиши текст новой задачи:")
+        return ADD_TASK
+
+    elif data == 'delete':
+        tasks = get_tasks(user_id)
+        if not tasks:
+            await query.edit_message_text("У тебя нет задач для удаления.", reply_markup=tasks_keyboard())
+            return ConversationHandler.END
+        text = "Выбери номер задачи для удаления:\n"
+        for i, (task_id, task, _) in enumerate(tasks, 1):
+            text += f"{i}. {task}\n"
+        await query.edit_message_text(text)
+        return DELETE_TASK
+
+    elif data == 'edit':
+        tasks = get_tasks(user_id)
+        if not tasks:
+            await query.edit_message_text("У тебя нет задач для изменения.", reply_markup=tasks_keyboard())
+            return ConversationHandler.END
+        text = "Выбери номер задачи для изменения:\n"
+        for i, (task_id, task, _) in enumerate(tasks, 1):
+            text += f"{i}. {task}\n"
+        await query.edit_message_text(text)
+        return EDIT_SELECT
+
+    elif data == 'remind':
+        tasks = get_tasks(user_id)
+        if not tasks:
+            await query.edit_message_text("У тебя нет задач для установки напоминания.", reply_markup=reminders_keyboard())
+            return ConversationHandler.END
+        text = "Выбери номер задачи для установки напоминания:\n"
+        for i, (task_id, task, _) in enumerate(tasks, 1):
+            text += f"{i}. {task}\n"
+        await query.edit_message_text(text)
+        return REMIND_SELECT_TASK
+    
+    elif data == 'edit_reminder':
+        tasks = get_tasks(user_id)
+        reminder_tasks = [t for t in tasks if t[2]]
+        if not reminder_tasks:
+            await query.edit_message_text("У тебя нет задач с напоминаниями.", reply_markup=reminders_keyboard())
+            return ConversationHandler.END
+        text = "Выбери номер задачи для изменения напоминания:\n"
+        for i, (task_id, task, reminder) in enumerate(reminder_tasks, 1):
+            text += f"{i}. {task}\n"
+        context.user_data['reminder_tasks'] = reminder_tasks
+        await query.edit_message_text(text)
+        return EDIT_REMIND_SELECT
+
+    elif data == 'delete_reminder':
+        tasks = get_tasks(user_id)
+        reminder_tasks = [t for t in tasks if t[2]]
+        if not reminder_tasks:
+            await query.edit_message_text("У тебя нет задач с напоминаниями.", reply_markup=reminders_keyboard())
+            return ConversationHandler.END
+        text = "Выбери номер задачи для удаления напоминания:\n"
+        for i, (task_id, task, reminder) in enumerate(reminder_tasks, 1):
+            text += f"{i}. {task}\n"
+        context.user_data['reminder_tasks'] = reminder_tasks
+        await query.edit_message_text(text)
+        return DELETE_REMIND_SELECT
+
+    else:
+        await query.edit_message_text("Неизвестная команда", reply_markup=main_keyboard())
+        return ConversationHandler.END
+
+# Добавление задачи
+async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    task_text = update.message.text.strip()
+    if not task_text:
+        await update.message.reply_text("Текст задачи не может быть пустым. Попробуй ещё раз:")
+        return ADD_TASK
+
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO tasks (user_id, task) VALUES (?, ?)", (user_id, task_text))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("Задача добавлена.", reply_markup=main_keyboard())
+    return ConversationHandler.END
+
+# Удаление задачи
+async def delete_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    try:
+        num = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введи номер задачи цифрой:")
+        return DELETE_TASK
+
+    tasks = get_tasks(user_id)
+    if num < 1 or num > len(tasks):
+        await update.message.reply_text("Такого номера задачи нет. Введи корректный номер:")
+        return DELETE_TASK
+
+    task_id = tasks[num - 1][0]
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("Задача удалена.", reply_markup=main_keyboard())
+    return ConversationHandler.END
+
+# Выбор задачи для редактирования
+async def edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    try:
+        num = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введи номер задачи цифрой:")
+        return EDIT_SELECT
+
+    tasks = get_tasks(user_id)
+    if num < 1 or num > len(tasks):
+        await update.message.reply_text("Такого номера задачи нет. Введи корректный номер:")
+        return EDIT_SELECT
+
+    context.user_data['edit_task_id'] = tasks[num - 1][0]
+    await update.message.reply_text("Напиши новый текст задачи:")
+    return EDIT_TASK
+
+# Редактирование задачи
+async def edit_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    new_text = update.message.text.strip()
+    if not new_text:
+        await update.message.reply_text("Текст задачи не может быть пустым. Попробуй ещё раз:")
+        return EDIT_TASK
+
+    task_id = context.user_data.get('edit_task_id')
+    if not task_id:
+        await update.message.reply_text("Что-то пошло не так. Попробуй ещё раз.")
+        return ConversationHandler.END
+
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    c.execute("UPDATE tasks SET task = ? WHERE id = ? AND user_id = ?", (new_text, task_id, user_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("Задача изменена.", reply_markup=main_keyboard())
+    return ConversationHandler.END
+
+# Выбор задачи для напоминания
+async def remind_select_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    try:
+        num = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введи номер задачи цифрой:")
+        return REMIND_SELECT_TASK
+
+    tasks = get_tasks(user_id)
+    if num < 1 or num > len(tasks):
+        await update.message.reply_text("Такого номера задачи нет. Введи корректный номер:")
+        return REMIND_SELECT_TASK
+
+    context.user_data['remind_task_id'] = tasks[num - 1][0]
+    await update.message.reply_text("Введи дату напоминания в формате ДД.ММ.ГГГГ (например, 16.05.2025):")
+    return REMIND_DATE
+
+# Получение даты для напоминания
+async def remind_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    date_str = update.message.text.strip()
+    try:
+        date_obj = datetime.strptime(date_str, "%d.%m.%Y")
+    except ValueError:
+        await update.message.reply_text("Неверный формат даты. Введи в формате ДД.ММ.ГГГГ:")
+        return REMIND_DATE
+
+    context.user_data['remind_date'] = date_obj
+    await update.message.reply_text("Теперь введи время напоминания в формате ЧЧ:ММ (например, 16:30):")
+    return REMIND_TIME
+
+# Получение времени для напоминания и сохранение
+async def remind_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    time_str = update.message.text.strip()
+    try:
+        time_obj = datetime.strptime(time_str, "%H:%M").time()
+    except ValueError:
+        await update.message.reply_text("Неверный формат времени. Введи в формате ЧЧ:ММ:")
+        return REMIND_TIME
+
+    date_obj = context.user_data.get('remind_date')
+    if not date_obj:
+        await update.message.reply_text("Что-то пошло не так. Попробуй заново.")
+        return ConversationHandler.END
+
+    reminder_dt = datetime.combine(date_obj.date(), time_obj).replace(tzinfo=MSK)
+    if reminder_dt <= datetime.now(MSK):
+        await update.message.reply_text("Время напоминания должно быть в будущем. Введи дату заново:")
+        return REMIND_DATE
+
+    task_id = context.user_data.get('remind_task_id')
+    user_id = update.message.from_user.id
+    if not task_id:
+        await update.message.reply_text("Что-то пошло не так. Попробуй заново.")
+        return ConversationHandler.END
+
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    c.execute("UPDATE tasks SET reminder_datetime = ? WHERE id = ? AND user_id = ?", (reminder_dt.isoformat(), task_id, user_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"Напоминание установлено на {reminder_dt.strftime('%d.%m.%Y %H:%M')}", reply_markup=main_keyboard())
+    return ConversationHandler.END
+
+# Выбор задачи для изменения напоминания
+async def edit_remind_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        num = int(update.message.text.strip())
+        tasks = context.user_data['reminder_tasks']
+        if num < 1 or num > len(tasks):
+            raise ValueError
+    except:
+        await update.message.reply_text("Неверный номер. Введи корректный номер:")
+        return EDIT_REMIND_SELECT
+
+    context.user_data['remind_task_id'] = tasks[num - 1][0]
+    await update.message.reply_text("Введи новую дату в формате ДД.ММ.ГГГГ:")
+    return EDIT_REMIND_DATE
+
+# Получение новой даты для напоминания
+async def edit_remind_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    date_str = update.message.text.strip()
+    try:
+        date_obj = datetime.strptime(date_str, "%d.%m.%Y")
+    except ValueError:
+        await update.message.reply_text("Неверный формат даты. Введи в формате ДД.ММ.ГГГГ:")
+        return EDIT_REMIND_DATE
+
+    context.user_data['remind_date'] = date_obj
+    await update.message.reply_text("Теперь введи новое время напоминания в формате ЧЧ:ММ:")
+    return EDIT_REMIND_TIME
+
+# Получение нового времени для напоминания
+async def edit_remind_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    time_str = update.message.text.strip()
+    try:
+        time_obj = datetime.strptime(time_str, "%H:%M").time()
+    except ValueError:
+        await update.message.reply_text("Неверный формат времени. Введи в формате ЧЧ:ММ:")
+        return EDIT_REMIND_TIME
+
+    date_obj = context.user_data.get('remind_date')
+    if not date_obj:
+        await update.message.reply_text("Что-то пошло не так. Попробуй заново.")
+        return ConversationHandler.END
+
+    reminder_dt = datetime.combine(date_obj.date(), time_obj).replace(tzinfo=MSK)
+    if reminder_dt <= datetime.now(MSK):
+        await update.message.reply_text("Время напоминания должно быть в будущем. Введи дату заново:")
+        return EDIT_REMIND_DATE
+
+    task_id = context.user_data.get('remind_task_id')
+    user_id = update.message.from_user.id
+    if not task_id:
+        await update.message.reply_text("Что-то пошло не так. Попробуй заново.")
+        return ConversationHandler.END
+
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    c.execute("UPDATE tasks SET reminder_datetime = ? WHERE id = ? AND user_id = ?", (reminder_dt.isoformat(), task_id, user_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"Напоминание изменено на {reminder_dt.strftime('%d.%m.%Y %H:%M')}", reply_markup=main_keyboard())
+    return ConversationHandler.END
+
+# Удаление напоминания
+async def delete_remind_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        num = int(update.message.text.strip())
+        tasks = context.user_data['reminder_tasks']
+        if num < 1 or num > len(tasks):
+            raise ValueError
+    except:
+        await update.message.reply_text("Неверный номер. Введи корректный номер:")
+        return DELETE_REMIND_SELECT
+
+    task_id = tasks[num - 1][0]
+    conn = sqlite3.connect('tasks.db')
+    c = conn.cursor()
+    c.execute("UPDATE tasks SET reminder_datetime = NULL WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("Напоминание удалено.", reply_markup=main_keyboard())
+    return ConversationHandler.END
+
+# Проверка и отправка напоминаний
+async def reminder_checker(application):
+    while True:
+        conn = sqlite3.connect('tasks.db')
+        c = conn.cursor()
+        now_iso = datetime.now(MSK).isoformat()
+        c.execute("SELECT id, user_id, task FROM tasks WHERE reminder_datetime <= ? AND reminder_datetime IS NOT NULL", (now_iso,))
+        rows = c.fetchall()
+        for task_id, user_id, task_text in rows:
+            try:
+                await application.bot.send_message(chat_id=user_id, text=f"⏰ Напоминание: {task_text}")
+                c.execute("UPDATE tasks SET reminder_datetime = NULL WHERE id = ?", (task_id,))
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Ошибка при отправке напоминания пользователю {user_id}: {e}")
+        conn.close()
+        await asyncio.sleep(60)
+
+# Обработка любых сообщений не в процессе команды
+async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get('current_state') is None:
+        await update.message.reply_text("Выбери действие:", reply_markup=main_keyboard())
+    else:
+        state = context.user_data.get('current_state')
+        if state == ADD_TASK:
+            await update.message.reply_text("Напиши текст новой задачи:")
+        elif state == DELETE_TASK:
+            await update.message.reply_text("Введи номер задачи для удаления:")
+        elif state == EDIT_SELECT:
+            await update.message.reply_text("Введи номер задачи для изменения:")
+        elif state == EDIT_TASK:
+            await update.message.reply_text("Напиши новый текст задачи:")
+        elif state == REMIND_SELECT_TASK:
+            await update.message.reply_text("Введи номер задачи для установки напоминания:")
+        elif state == REMIND_DATE:
+            await update.message.reply_text("Введи дату в формате ДД.ММ.ГГГГ:")
+        elif state == REMIND_TIME:
+            await update.message.reply_text("Введи время в формате ЧЧ:ММ:")
+        else:
+            await update.message.reply_text("Выбери действие:", reply_markup=main_keyboard())
+
+# Основная функция запуска бота
+async def run_bot():
+    global bot_app
+    init_db()
+    bot_app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler)],
+        states={
+            ADD_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_task)],
+            DELETE_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_task)],
+            EDIT_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_select)],
+            EDIT_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_task)],
+            REMIND_SELECT_TASK: [MessageHandler(filters.TEXT & ~filters.COMMAND, remind_select_task)],
+            REMIND_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, remind_date)],
+            REMIND_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, remind_time)],
+            EDIT_REMIND_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_remind_select)],
+            EDIT_REMIND_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_remind_date)],
+            EDIT_REMIND_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_remind_time)],
+            DELETE_REMIND_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_remind_select)],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(conv_handler)
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_message))
+
+    # Запуск фоновой задачи
+    bot_app.job_queue.run_repeating(lambda ctx: asyncio.create_task(reminder_checker(bot_app)), interval=60, first=5)
+
+    # Установка Webhook
+    WEBHOOK_URL = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
+    await bot_app.bot.set_webhook(WEBHOOK_URL)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(run_bot())
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
